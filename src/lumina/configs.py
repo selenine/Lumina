@@ -98,7 +98,7 @@ class SamplerConfig:
 
 @dataclass
 class DataConfig:
-    dataset: str = "ILSVRC/imagenet-1k"
+    dataset: str = "Fhrozen/relaion-art"
     split: str = "train"
     resolution: int = 256
     preprocessed: bool = False
@@ -106,8 +106,7 @@ class DataConfig:
     shuffle: bool = True
     shuffle_buffer: int = 10_000
     image_key: str = "image"
-    label_key: str = "label"
-    prompt_template: str = "a photo of a {}"
+    caption_key: str = "text"
     max_tokens: int = 77
     encoder: str = "facebook/dinov3-vitb16-pretrain-lvd1689m"
     n_stat_batches: int = 50

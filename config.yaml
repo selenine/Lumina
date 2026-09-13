@@ -7,8 +7,7 @@ data:
   shuffle: true
   shuffle_buffer: 10000
   image_key: image
-  label_key: label
-  prompt_template: "a photo of a {}"
+  caption_key: text
   max_tokens: 77
   encoder: facebook/dinov3-vitb16-pretrain-lvd1689m
   n_stat_batches: 16
@@ -49,10 +48,10 @@ sampler:
     save_interval: 5000
     sample_interval: 2500
     sample_prompts:
-      - "a photo of a golden retriever"
-      - "a photo of a monarch butterfly"
-      - "a photo of a espresso maker"
-      - "a photo of a volcano"
+      - "an oil painting of a lighthouse on a stormy coast"
+      - "a watercolor landscape of mountains at sunset"
+      - "an ink sketch of a cat sleeping on a windowsill"
+      - "an abstract painting with bold geometric shapes"
     sample_steps: 2
     sample_guidance: 3.0
     output_dir: ./checkpoints
