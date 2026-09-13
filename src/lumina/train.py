@@ -11,6 +11,7 @@ from accelerate import Accelerator
 from torch import optim
 from torch.nn import functional as F
 from torch.optim.lr_scheduler import LambdaLR
+from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 from torch.utils.data import DataLoader
 from torchvision.utils import make_grid, save_image
 from tqdm import tqdm
@@ -29,61 +30,13 @@ from .nn.latents import Decoder, Discriminator, Encoder, PixelDiscriminator
 from .nn.model import DiT, Sampler
 
 
-def cosine_lr(n_warmup: int, max_steps: int):
-    def lr_lambda(step: int) -> float:
-        if step < n_warmup:
-            return (step + 1) / max(n_warmup, 1)
+def cosine_lr(step: int, n_warmup: int, max_steps: int) -> float:
+    if step < n_warmup:
+        return (step + 1) / max(n_warmup, 1)
 
-        progress = (step - n_warmup) / max(max_steps - n_warmup, 1)
+    progress = (step - n_warmup) / max(max_steps - n_warmup, 1)
 
-        return 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
-
-    return lr_lambda
-
-
-class EMA:
-    def __init__(self, model: torch.nn.Module, decay: float) -> None:
-        self.model = model
-        self.decay = decay
-        self.shadow = {
-            key: value.detach().clone().float()
-            for key, value in model.state_dict().items()
-            if value.is_floating_point()
-        }
-
-    @torch.no_grad()
-    def update(self) -> None:
-        for key, value in self.model.state_dict().items():
-            if key in self.shadow:
-                self.shadow[key].lerp_(value.detach().float(), 1.0 - self.decay)
-
-    def state_dict(self) -> dict:
-        return self.shadow
-
-    def load_state_dict(self, state: dict) -> None:
-        for key, value in state.items():
-            if key in self.shadow:
-                self.shadow[key].copy_(value)
-
-    def weights(self) -> dict:
-        return {
-            key: self.shadow[key].to(value.dtype)
-            for key, value in self.model.state_dict().items()
-            if key in self.shadow
-        }
-
-    @contextlib.contextmanager
-    def averaged(self):
-        backup = {
-            key: value.detach().clone()
-            for key, value in self.model.state_dict().items()
-            if key in self.shadow
-        }
-        self.model.load_state_dict(self.weights(), strict=False)
-        try:
-            yield self.model
-        finally:
-            self.model.load_state_dict(backup, strict=False)
+    return 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
 
 
 class _Runner:
@@ -132,7 +85,8 @@ class _Runner:
             model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
         )
         scheduler = LambdaLR(
-            optimizer, lr_lambda=cosine_lr(cfg.n_warmup, cfg.max_steps)
+            optimizer,
+            lr_lambda=lambda step: cosine_lr(step, cfg.n_warmup, cfg.max_steps),
         )
 
         self.model, self.dataloader, self.optimizer, self.scheduler = (
@@ -140,7 +94,15 @@ class _Runner:
         )
 
         self.net = self.accel.unwrap_model(self.model)
-        self.ema = EMA(self.net, cfg.ema_decay) if cfg.ema_decay > 0 else None
+        self.ema = (
+            AveragedModel(
+                self.net,
+                multi_avg_fn=get_ema_multi_avg_fn(cfg.ema_decay),
+                use_buffers=True,
+            )
+            if cfg.ema_decay > 0
+            else None
+        )
         self.encoder = Encoder(data.encoder).to(self.device)
 
         if cfg.compile:
@@ -158,7 +120,8 @@ class _Runner:
                 self.optimizer.load_state_dict(state["optimizer"])
                 self.scheduler.load_state_dict(state["scheduler"])
                 if self.ema is not None and "ema" in state:
-                    self.ema.load_state_dict(state["ema"])
+                    self.ema.module.load_state_dict(state["ema"])
+                    self.ema.n_averaged.fill_(1)
                 if "stats" in state:
                     self.encoder.load_stats(state["stats"])
                 self.step = state["step"]
@@ -187,11 +150,20 @@ class _Runner:
             f"pixel mean {pixel} latent std {self.encoder.latent_std.mean():.4f}"
         )
 
+    @contextlib.contextmanager
     def averaged(self):
         if self.ema is None:
-            return contextlib.nullcontext()
+            yield self.net
+            return
 
-        return self.ema.averaged()
+        backup = {
+            key: value.detach().clone() for key, value in self.net.state_dict().items()
+        }
+        self.net.load_state_dict(self.ema.module.state_dict())
+        try:
+            yield self.net
+        finally:
+            self.net.load_state_dict(backup)
 
     def sample_dir(self) -> str:
         path = os.path.join(self.cfg.output_dir, "samples")
@@ -221,7 +193,7 @@ class _Runner:
             "stats": self.encoder.stats_dict(),
         }
         if self.ema is not None:
-            state["ema"] = self.ema.state_dict()
+            state["ema"] = self.ema.module.state_dict()
         if extra is not None:
             state.update(extra)
 
@@ -234,7 +206,11 @@ class _Runner:
         if not self.accel.is_main_process:
             return
 
-        weights = self.ema.weights() if self.ema is not None else self.net.state_dict()
+        weights = (
+            self.ema.module.state_dict()
+            if self.ema is not None
+            else self.net.state_dict()
+        )
 
         self.accel.save(
             {"model": weights, "stats": self.encoder.stats_dict()},
@@ -270,7 +246,7 @@ class _Runner:
                 self.scheduler.step()
 
                 if self.ema is not None:
-                    self.ema.update()
+                    self.ema.update_parameters(self.net)
 
                 value = loss.item()
                 lr = self.scheduler.get_last_lr()[0]
@@ -484,7 +460,9 @@ def train_decoder(
         disc_opt = optim.AdamW(disc.parameters(), lr=cfg.gan_lr, betas=(0.5, 0.9))
         disc_sched = LambdaLR(
             disc_opt,
-            lr_lambda=cosine_lr(cfg.n_warmup, max(cfg.max_steps - cfg.gan_start, 1)),
+            lr_lambda=lambda step: cosine_lr(
+                step, cfg.n_warmup, max(cfg.max_steps - cfg.gan_start, 1)
+            ),
         )
         disc, disc_opt, disc_sched = accel.prepare(disc, disc_opt, disc_sched)
 
